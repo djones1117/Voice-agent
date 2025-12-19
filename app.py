@@ -3,6 +3,7 @@ import json
 import base64
 import logging
 import asyncio
+# import uuid
 from typing import Dict, Any, List, AsyncIterator, Optional
 
 import boto3
@@ -146,7 +147,7 @@ class VoiceAgent:
             except Exception:
                 pass
 
-        self.conversation_log.append({"role": role, "content": content})
+        self.conversation_log.append({"role": role, "content": content})  
 
 
     # ---- AWS auth wiring ----
@@ -243,6 +244,44 @@ class VoiceAgent:
             value=BidirectionalInputPayloadPart(bytes_=raw)
         )
         await self._bidi_stream.input_stream.send(chunk)
+
+    # async def send_user_text(self, text: str) -> None:
+    #     if not text:
+    #         return
+
+    #     content_name = f"user-text-{uuid.uuid4().hex[:6]}"
+
+    #     await self._emit_event(
+    #         {
+    #             "event": {
+    #                 "contentStart": {
+    #                     "promptName": self._prompt_key,
+    #                     "contentName": content_name,
+    #                     "type": "TEXT",
+    #                     "interactive": False,
+    #                     "role": "USER",
+    #                     "textInputConfiguration": {"mediaType": "text/plain"},
+    #                 }
+    #             }
+    #         }
+    #     )
+
+    #     await self._emit_event(
+    #         {
+    #             "event": {
+    #                 "textInput": {
+    #                     "promptName": self._prompt_key,
+    #                     "contentName": content_name,
+    #                     "content": text,
+    #                 }
+    #             }
+    #         }
+    #     )
+
+    #     await self._emit_event(
+    #         {"event": {"contentEnd": {"promptName": self._prompt_key, "contentName": content_name}}}
+    #     )
+
 
     async def _send_system_block(self, text: str) -> None:
         if not text:
@@ -464,7 +503,7 @@ async def fetch_conversation(stream_sid: str):
         return {"stream_sid": stream_sid, "context_window": []}
     return {"stream_sid": stream_sid, "context_window": client.conversation_log}
 
-
+#phase 1 entry point 
 @api.post("/twilio_entrypoint")
 async def twilio_entrypoint(req: Request):
     """
@@ -489,6 +528,21 @@ async def voice_agent(ws: WebSocket):
     sid: Optional[str] = None
     bot: Optional[VoiceAgent] = None
     play_task: Optional[asyncio.Task] = None
+
+    last_media_ts = asyncio.get_event_loop().time()
+    keepalive_task: Optional[asyncio.Task] = None
+
+    async def _nova_keepalive():
+        # 20ms silence @ 16k PCM16 => 320 samples * 2 bytes = 640 bytes
+        silence_pcm16_16k = b"\x00" * 640
+        while True:
+            await asyncio.sleep(1.0)
+            if bot and not bot._stop_flag.is_set():
+                now = asyncio.get_event_loop().time()
+                # only push silence if nothing has arrived recently
+                if (now - last_media_ts) > 1.5:
+                    await bot.push_audio(silence_pcm16_16k)
+
 
     async def _playback_to_twilio(local_sid: str, client: VoiceAgent):
         """
@@ -544,9 +598,13 @@ async def voice_agent(ws: WebSocket):
                 await bot.begin()
                 await bot.ensure_audio_input_open()
 
+                keepalive_task = asyncio.create_task(_nova_keepalive())
+
+
                 play_task = asyncio.create_task(_playback_to_twilio(sid, bot))
 
             elif evt_type == "media":
+                last_media_ts = asyncio.get_event_loop().time()
                 if not bot or not sid:
                     continue
 
@@ -566,6 +624,8 @@ async def voice_agent(ws: WebSocket):
     except Exception as e:
         log.error(f"Error in WebSocket handler: {e}", exc_info=True)
     finally:
+        if keepalive_task:
+            keepalive_task.cancel()
         if bot:
             await bot.close_audio_input()
             await bot.shutdown()
@@ -574,6 +634,35 @@ async def voice_agent(ws: WebSocket):
         if sid and sid in active_calls:
             del active_calls[sid]
         await ws.close()
+
+@api.post("/twilio_conference_entrypoint")
+async def twilio_conference_entrypoint(req: Request):
+    conf = req.query_params.get("conf", "phase2-default")
+    ws_url = f"{PUBLIC_WSS_BASE}/voice_agent"
+
+  
+    max_seconds = int(os.getenv("BRIDGE_MAX_SECONDS", "60"))
+
+    twiml = f"""
+<Response>
+  <Start>
+    <Stream url="{ws_url}" track="both_tracks"/>
+  </Start>
+
+  <Dial timeLimit="{max_seconds}">
+    <Conference
+      startConferenceOnEnter="true"
+      endConferenceOnExit="false"
+      beep="false"
+    >{conf}</Conference>
+  </Dial>
+</Response>
+""".strip()
+
+    return PlainTextResponse(content=twiml, media_type="text/xml")
+
+
+
 
 
 if __name__ == "__main__":
