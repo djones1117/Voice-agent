@@ -3,7 +3,6 @@ import json
 import base64
 import logging
 import asyncio
-# import uuid
 from typing import Dict, Any, List, AsyncIterator, Optional
 
 import boto3
@@ -245,43 +244,6 @@ class VoiceAgent:
         )
         await self._bidi_stream.input_stream.send(chunk)
 
-    # async def send_user_text(self, text: str) -> None:
-    #     if not text:
-    #         return
-
-    #     content_name = f"user-text-{uuid.uuid4().hex[:6]}"
-
-    #     await self._emit_event(
-    #         {
-    #             "event": {
-    #                 "contentStart": {
-    #                     "promptName": self._prompt_key,
-    #                     "contentName": content_name,
-    #                     "type": "TEXT",
-    #                     "interactive": False,
-    #                     "role": "USER",
-    #                     "textInputConfiguration": {"mediaType": "text/plain"},
-    #                 }
-    #             }
-    #         }
-    #     )
-
-    #     await self._emit_event(
-    #         {
-    #             "event": {
-    #                 "textInput": {
-    #                     "promptName": self._prompt_key,
-    #                     "contentName": content_name,
-    #                     "content": text,
-    #                 }
-    #             }
-    #         }
-    #     )
-
-    #     await self._emit_event(
-    #         {"event": {"contentEnd": {"promptName": self._prompt_key, "contentName": content_name}}}
-    #     )
-
 
     async def _send_system_block(self, text: str) -> None:
         if not text:
@@ -448,8 +410,13 @@ class VoiceAgent:
 
                         self._text_accumulator = ""
 
+        except (OSError, ValueError) as e:
+            # Normal when the stream is closing and the reader is mid-receive
+            if not self._stop_flag.is_set():
+                log.error(f"Error in Nova Sonic response processing: {e}", exc_info=True)
         except Exception as e:
             log.error(f"Error in Nova Sonic response processing: {e}", exc_info=True)
+
         finally:
             log.info(
                 "Nova Sonic stream closed. Events=%d, audio_chunks=%d, text_outputs=%d",
@@ -468,13 +435,23 @@ class VoiceAgent:
 
     async def shutdown(self) -> None:
         self._stop_flag.set()
-        if self._reader_task:
-            self._reader_task.cancel()
+
+    # Close stream first to unblock receives
         if self._bidi_stream:
             try:
                 await self._bidi_stream.close()
             except Exception:
                 pass
+
+    # Let reader exit naturally; only cancel if it hangs
+        if self._reader_task:
+            try:
+                await asyncio.wait_for(self._reader_task, timeout=2.0)
+            except asyncio.TimeoutError:
+                self._reader_task.cancel()
+            except Exception:
+                pass
+
 
 
 # -----------------------------------------------------------------------------
@@ -503,21 +480,25 @@ async def fetch_conversation(stream_sid: str):
         return {"stream_sid": stream_sid, "context_window": []}
     return {"stream_sid": stream_sid, "context_window": client.conversation_log}
 
-#phase 1 entry point 
 @api.post("/twilio_entrypoint")
 async def twilio_entrypoint(req: Request):
-    """
-    Twilio Voice webhook: respond with TwiML that connects to agent WebSocket.
-    """
     ws_url = f"{PUBLIC_WSS_BASE}/voice_agent"
+
+    say = ""
+    if os.getenv("AUTO_START", "0") == "1":
+        # Twilio speaks into the call (no AWS Polly needed)
+        say = '<Say voice="Polly.Joanna">Hello. Please start with a short question.</Say>'
+
     twiml = f"""
 <Response>
+  {say}
   <Connect>
     <Stream url="{ws_url}" />
   </Connect>
 </Response>
 """.strip()
     return PlainTextResponse(content=twiml, media_type="text/xml")
+
 
 
 @api.websocket("/voice_agent")
@@ -624,43 +605,18 @@ async def voice_agent(ws: WebSocket):
     except Exception as e:
         log.error(f"Error in WebSocket handler: {e}", exc_info=True)
     finally:
-        if keepalive_task:
+        if  keepalive_task:
             keepalive_task.cancel()
+
+        if  play_task:
+            play_task.cancel()
+
         if bot:
             await bot.close_audio_input()
             await bot.shutdown()
-        if play_task:
-            play_task.cancel()
-        if sid and sid in active_calls:
-            del active_calls[sid]
-        await ws.close()
 
-@api.post("/twilio_conference_entrypoint")
-async def twilio_conference_entrypoint(req: Request):
-    conf = req.query_params.get("conf", "phase2-default")
-    ws_url = f"{PUBLIC_WSS_BASE}/voice_agent"
-
-  
-    max_seconds = int(os.getenv("BRIDGE_MAX_SECONDS", "60"))
-
-    twiml = f"""
-<Response>
-  <Start>
-    <Stream url="{ws_url}" track="both_tracks"/>
-  </Start>
-
-  <Dial timeLimit="{max_seconds}">
-    <Conference
-      startConferenceOnEnter="true"
-      endConferenceOnExit="false"
-      beep="false"
-    >{conf}</Conference>
-  </Dial>
-</Response>
-""".strip()
-
-    return PlainTextResponse(content=twiml, media_type="text/xml")
-
+        if sid:
+           active_calls.pop(sid, None)
 
 
 
