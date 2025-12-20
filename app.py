@@ -4,6 +4,7 @@ import base64
 import logging
 import asyncio
 from typing import Dict, Any, List, AsyncIterator, Optional
+from twilio.rest import Client
 
 import boto3
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
@@ -34,9 +35,37 @@ from smithy_aws_core.credentials_resolvers.environment import (
 # -----------------------------------------------------------------------------
 # Logging + environment configuration
 # -----------------------------------------------------------------------------
+def _log_parent_call_sid(call_sid: str) -> None:
+    """
+    Logs ParentCallSid (if any) for a given CallSid.
+    """
+    acct = os.getenv("TWILIO_ACCOUNT_SID")
+    token = os.getenv("TWILIO_AUTH_TOKEN")
+
+    if not acct or not token or not call_sid:
+        log.info(f"[twilio] CallSid={call_sid} (missing TWILIO creds or CallSid)")
+        return
+
+    try:
+        client = Client(acct, token)
+        call = client.calls(call_sid).fetch()
+
+        log.info(
+            f"[twilio] CallSid={call.sid} ParentCallSid={call.parent_call_sid} "
+            f"Status={call.status} Direction={call.direction}"
+        )
+    except Exception as e:
+        log.info(f"[twilio] Failed to fetch ParentCallSid for CallSid={call_sid}: {e}")
+
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("renamed-novasonic-app")
+# Phase 2 role config
+AGENT_ROLE = os.getenv("AGENT_ROLE", "A").upper()   # "A" or "B"
+PEER_DIAL_TO = os.getenv("PEER_DIAL_TO", "")        # only used when AGENT_ROLE == "A"
+MAX_SECONDS = int(os.getenv("BRIDGE_MAX_SECONDS", "60"))
+# kick off first spoken audio (Agent A only)
+KICKOFF_TEXT = os.getenv("KICKOFF_TEXT", "").strip()
 
 REGION_NAME = os.getenv("AWS_REGION", "us-east-1")
 MODEL_ARN_OR_ID = os.getenv("BEDROCK_MODEL_ID", "amazon.nova-2-sonic-v1:0")
@@ -233,6 +262,57 @@ class VoiceAgent:
 
         # background reader
         self._reader_task = asyncio.create_task(self._read_loop())
+    
+    #phase 2 initiate convo by sending text to nova (agents wont start talking until they hear something)
+    async def send_kickoff_text(self, text: str) -> None:
+        """
+        One-time USER text to trigger Nova to speak first.
+        After kickoff, the conversation is audio-driven via Twilio streams.
+        """
+        if not text or self._stop_flag.is_set():
+            return
+
+        content_name = "kickoff-1"
+        self._record("user", text)
+
+        await self._emit_event(
+            {
+                "event": {
+                    "contentStart": {
+                        "promptName": self._prompt_key,
+                        "contentName": content_name,
+                        "type": "TEXT",
+                        "interactive": True,
+                        "role": "USER",
+                        "textInputConfiguration": {"mediaType": "text/plain"},
+                    }
+                }
+            }
+        )
+
+        await self._emit_event(
+            {
+                "event": {
+                    "textInput": {
+                        "promptName": self._prompt_key,
+                        "contentName": content_name,
+                        "content": text,
+                    }
+                }
+            }
+        )
+
+        await self._emit_event(
+            {
+                "event": {
+                    "contentEnd": {
+                        "promptName": self._prompt_key,
+                        "contentName": content_name,
+                    }
+                }
+            }
+        )
+
 
     async def _emit_event(self, body: dict) -> None:
         if not self._bidi_stream:
@@ -482,6 +562,13 @@ async def fetch_conversation(stream_sid: str):
 
 @api.post("/twilio_entrypoint")
 async def twilio_entrypoint(req: Request):
+    form = await req.form()
+    call_sid = form.get("CallSid", "")
+    log.info(f"[twilio webhook] CallSid={call_sid} From={form.get('From')} To={form.get('To')} Direction={form.get('Direction')}")
+
+    _log_parent_call_sid(call_sid)
+
+
     ws_url = f"{PUBLIC_WSS_BASE}/voice_agent"
 
     say = ""
@@ -498,6 +585,64 @@ async def twilio_entrypoint(req: Request):
 </Response>
 """.strip()
     return PlainTextResponse(content=twiml, media_type="text/xml")
+
+
+##phase 2 entrypoint hit after running (orchestrator.py file)
+@api.post("/twilio_entrypoint_phase2")
+async def twilio_entrypoint_phase2(req: Request):
+    """
+    Phase 2 Twilio Voice webhook.
+
+    Agent A:
+      - Start Stream to Agent A websocket (does NOT take over call)
+      - Dial Agent B number (this is the actual bridge)
+
+    Agent B:
+      - Start Stream to Agent B websocket
+      - Pause to keep call open (do NOT dial)
+    """
+    ws_url = f"{PUBLIC_WSS_BASE}/voice_agent"
+
+    say = ""
+    if os.getenv("AUTO_START", "0") == "1":
+        say = '<Say voice="Polly.Joanna">Connecting agents now.</Say>'
+
+    if AGENT_ROLE == "A":
+        if not PEER_DIAL_TO:
+            twiml = f"""
+<Response>
+  <Say>Missing PEER_DIAL_TO for Agent A.</Say>
+</Response>
+""".strip()
+            return PlainTextResponse(content=twiml, media_type="text/xml")
+
+        twiml = f"""
+<Response>
+  {say}
+  <Start>
+    <Stream url="{ws_url}" track="both_tracks" />
+  </Start>
+
+  <Dial timeLimit="{MAX_SECONDS}">
+    <Number>{PEER_DIAL_TO}</Number>
+  </Dial>
+</Response>
+""".strip()
+        return PlainTextResponse(content=twiml, media_type="text/xml")
+
+    # Agent B: stream + stay connected, do NOT dial
+    twiml = f"""
+<Response>
+  {say}
+  <Start>
+    <Stream url="{ws_url}" track="both_tracks" />
+  </Start>
+
+  <Pause length="{MAX_SECONDS}" />
+</Response>
+""".strip()
+    return PlainTextResponse(content=twiml, media_type="text/xml")
+
 
 
 
@@ -578,6 +723,10 @@ async def voice_agent(ws: WebSocket):
 
                 await bot.begin()
                 await bot.ensure_audio_input_open()
+
+                ##phase 2 to initiate convo between two agents
+                if AGENT_ROLE == "A" and KICKOFF_TEXT:
+                    await bot.send_kickoff_text(KICKOFF_TEXT)
 
                 keepalive_task = asyncio.create_task(_nova_keepalive())
 
