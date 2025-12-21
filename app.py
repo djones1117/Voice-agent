@@ -73,7 +73,7 @@ MODEL_ARN_OR_ID = os.getenv("BEDROCK_MODEL_ID", "amazon.nova-2-sonic-v1:0")
 VOICE_NAME = os.getenv("AGENT_VOICE", "tiffany")
 BASE_SYSTEM_INSTRUCTIONS = os.getenv(
     "AGENT_SYSTEM_PROMPT",
-    "You are a helpful, friendly voice assistant named Sally. "
+    "You are a helpful, friendly voice assistant named tiffany. "
     "Speak clearly, keep responses brief, and be polite.",
 )
 
@@ -587,61 +587,7 @@ async def twilio_entrypoint(req: Request):
     return PlainTextResponse(content=twiml, media_type="text/xml")
 
 
-##phase 2 entrypoint hit after running (orchestrator.py file)
-@api.post("/twilio_entrypoint_phase2")
-async def twilio_entrypoint_phase2(req: Request):
-    """
-    Phase 2 Twilio Voice webhook.
 
-    Agent A:
-      - Start Stream to Agent A websocket (does NOT take over call)
-      - Dial Agent B number (this is the actual bridge)
-
-    Agent B:
-      - Start Stream to Agent B websocket
-      - Pause to keep call open (do NOT dial)
-    """
-    ws_url = f"{PUBLIC_WSS_BASE}/voice_agent"
-
-    say = ""
-    if os.getenv("AUTO_START", "0") == "1":
-        say = '<Say voice="Polly.Joanna">Connecting agents now.</Say>'
-
-    if AGENT_ROLE == "A":
-        if not PEER_DIAL_TO:
-            twiml = f"""
-<Response>
-  <Say>Missing PEER_DIAL_TO for Agent A.</Say>
-</Response>
-""".strip()
-            return PlainTextResponse(content=twiml, media_type="text/xml")
-
-        twiml = f"""
-<Response>
-  {say}
-  <Start>
-    <Stream url="{ws_url}" track="both_tracks" />
-  </Start>
-
-  <Dial timeLimit="{MAX_SECONDS}">
-    <Number>{PEER_DIAL_TO}</Number>
-  </Dial>
-</Response>
-""".strip()
-        return PlainTextResponse(content=twiml, media_type="text/xml")
-
-    # Agent B: stream + stay connected, do NOT dial
-    twiml = f"""
-<Response>
-  {say}
-  <Start>
-    <Stream url="{ws_url}" track="both_tracks" />
-  </Start>
-
-  <Pause length="{MAX_SECONDS}" />
-</Response>
-""".strip()
-    return PlainTextResponse(content=twiml, media_type="text/xml")
 
 
 
