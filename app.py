@@ -6,6 +6,10 @@ import asyncio
 from typing import Dict, Any, List, AsyncIterator, Optional
 import time
 import boto3
+import pathlib
+import uuid
+import db_utils as db
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.responses import PlainTextResponse, HTMLResponse
@@ -71,8 +75,13 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL") # public URL base for the twilio 
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER")  # your Twilio phone number
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+AGENT_NAME = os.getenv("AGENT_NAME", "A")
+APP_INSTANCE = "A"
+RUN_ID = os.getenv("RUN_ID", "")
+SCHEMA_SQL = (pathlib.Path(__file__).resolve().parent / "schema.sql").read_text(encoding="utf-8")
 
-AGENT_NAME = "A"
+
 
 
 
@@ -205,14 +214,32 @@ class VoiceAgent:
             except Exception:
                 pass
 
+
         entry = {
             "ts": time.time(),
-            "agent": AGENT_NAME,
+            "app_instance": AGENT_NAME, 
             "role": role,
             "content": content,
                     }
         self.conversation_log.append(entry)
         print(entry)
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(
+                db.insert_message(
+                    session_id=getattr(self, "session_id", "unknown"),
+                    call_sid=getattr(self, "call_sid", None),
+                    stream_sid=getattr(self, "stream_sid", None),
+                    app_instance=AGENT_NAME,
+                    role=role,
+                    content=content,
+                    ts_epoch=entry["ts"],
+                )
+            )
+        except RuntimeError:
+            pass
+
                                             
 
 
@@ -585,6 +612,16 @@ class VoiceAgent:
 
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is missing")
+    await db.init_pool(DATABASE_URL)
+    await db.ensure_schema(SCHEMA_SQL)
+    yield
+    await db.close_pool()
+
+
 
 
 
@@ -592,7 +629,7 @@ class VoiceAgent:
 # FastAPI app + routes
 # -----------------------------------------------------------------------------
 
-api = FastAPI()
+api = FastAPI(lifespan=lifespan)
 api.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -605,6 +642,15 @@ templates = Jinja2Templates(directory="templates")
 # streamSid -> agent
 active_calls: Dict[str, VoiceAgent] = {}
 
+def _speaker_from_role(app_instance: str, role: str) -> str:
+    if role == "user":
+        return "user"
+    if role == "system_prompt":
+        return "system"
+    return f"agent_{app_instance}"
+
+
+
 
 
 @api.get("/", response_class=HTMLResponse)
@@ -614,6 +660,16 @@ async def home(request: Request):
         "example_number": "+155555555",
     })
 
+@api.get("/sessions")
+async def sessions():
+    return {"sessions": await db.list_sessions(limit=50)}
+
+@api.get("/sessions/{session_id}")
+async def get_session(session_id: str):
+    msgs = await db.fetch_session(session_id)
+    for m in msgs:
+        m["speaker"] = _speaker_from_role(m.get("app_instance", "?"), m.get("role", ""))
+    return {"session_id": session_id, "messages": msgs}
 
 
 @api.get("/context/{stream_sid}")
@@ -694,6 +750,10 @@ async def voice_agent(ws: WebSocket):
                 sid = start.get("streamSid")
                 log.info(f"Stream START: streamSid={sid}")
 
+                call_sid = start.get("callSid")  
+                base_session = call_sid or str(uuid.uuid4())
+                session_id = f"{RUN_ID}:{base_session}" if RUN_ID else base_session
+
                 bot = VoiceAgent(
                     region=REGION_NAME,
                     model_id=MODEL_ARN_OR_ID,
@@ -701,6 +761,10 @@ async def voice_agent(ws: WebSocket):
                     system_text=BASE_SYSTEM_INSTRUCTIONS,
                     talk_first=False
                 )
+
+                bot.session_id = session_id
+                bot.call_sid = call_sid
+                bot.stream_sid = sid
                 active_calls[sid] = bot
 
                 await bot.begin()
