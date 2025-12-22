@@ -626,7 +626,6 @@ async def fetch_conversation(stream_sid: str):
         return {"stream_sid": stream_sid, "context_window": []}
     return {"stream_sid": stream_sid, "context_window": client.conversation_log}
 
-
 @api.post("/twilio_entrypoint")
 async def twilio_entrypoint(req: Request):
     """
