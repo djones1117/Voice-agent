@@ -4,12 +4,13 @@ import base64
 import logging
 import asyncio
 from typing import Dict, Any, List, AsyncIterator, Optional
-from twilio.rest import Client
-
+import time
 import boto3
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import PlainTextResponse
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
+from fastapi.responses import PlainTextResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.templating import Jinja2Templates
 
 import numpy as np
 from scipy.signal import resample_poly
@@ -32,40 +33,19 @@ from smithy_aws_core.credentials_resolvers.environment import (
     EnvironmentCredentialsResolver,
 )
 
+from twilio.rest import Client as TwilioClient
+
+
+
+
+
+
 # -----------------------------------------------------------------------------
 # Logging + environment configuration
 # -----------------------------------------------------------------------------
-def _log_parent_call_sid(call_sid: str) -> None:
-    """
-    Logs ParentCallSid (if any) for a given CallSid.
-    """
-    acct = os.getenv("TWILIO_ACCOUNT_SID")
-    token = os.getenv("TWILIO_AUTH_TOKEN")
-
-    if not acct or not token or not call_sid:
-        log.info(f"[twilio] CallSid={call_sid} (missing TWILIO creds or CallSid)")
-        return
-
-    try:
-        client = Client(acct, token)
-        call = client.calls(call_sid).fetch()
-
-        log.info(
-            f"[twilio] CallSid={call.sid} ParentCallSid={call.parent_call_sid} "
-            f"Status={call.status} Direction={call.direction}"
-        )
-    except Exception as e:
-        log.info(f"[twilio] Failed to fetch ParentCallSid for CallSid={call_sid}: {e}")
-
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("renamed-novasonic-app")
-# Phase 2 role config
-AGENT_ROLE = os.getenv("AGENT_ROLE", "A").upper()   # "A" or "B"
-PEER_DIAL_TO = os.getenv("PEER_DIAL_TO", "")        # only used when AGENT_ROLE == "A"
-MAX_SECONDS = int(os.getenv("BRIDGE_MAX_SECONDS", "60"))
-# kick off first spoken audio (Agent A only)
-KICKOFF_TEXT = os.getenv("KICKOFF_TEXT", "").strip()
+log = logging.getLogger("novasonic-app")
 
 REGION_NAME = os.getenv("AWS_REGION", "us-east-1")
 MODEL_ARN_OR_ID = os.getenv("BEDROCK_MODEL_ID", "amazon.nova-2-sonic-v1:0")
@@ -73,7 +53,7 @@ MODEL_ARN_OR_ID = os.getenv("BEDROCK_MODEL_ID", "amazon.nova-2-sonic-v1:0")
 VOICE_NAME = os.getenv("AGENT_VOICE", "tiffany")
 BASE_SYSTEM_INSTRUCTIONS = os.getenv(
     "AGENT_SYSTEM_PROMPT",
-    "You are a helpful, friendly voice assistant named tiffany. "
+    "You are a helpful, friendly voice assistant named Sally. "
     "Speak clearly, keep responses brief, and be polite.",
 )
 
@@ -81,7 +61,35 @@ NOVA_IN_HZ = 16000     # Nova Sonic audioInput sample rate (PCM16)
 NOVA_OUT_HZ = 24000    # Nova Sonic audioOutput sample rate (PCM16)
 TWILIO_HZ = 8000        # Twilio Media Streams μ-law 8 kHz
 
-PUBLIC_WSS_BASE = os.getenv("WSS_VOICE_URL", "wss://unrancoured-marled-quiana.ngrok-free.dev")
+
+
+
+PUBLIC_WSS_BASE = os.getenv("WSS_VOICE_URL") # public URL base for the websocket agent endpoint 
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL") # public URL base for the twilio entry point
+
+
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER")  # your Twilio phone number
+
+AGENT_NAME = "A"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 # -----------------------------------------------------------------------------
@@ -120,6 +128,24 @@ def _pcm16_24k_to_twilio_b64_ulaw(pcm24k: bytes) -> str:
     return base64.b64encode(ulaw).decode("ascii")
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # -----------------------------------------------------------------------------
 # Minimal Nova Sonic bidirectional client with context capture
 # -----------------------------------------------------------------------------
@@ -134,7 +160,7 @@ class VoiceAgent:
     - Maintains a conversation_log list[dict] with what was said
     """
 
-    def __init__(self, region: str, model_id: str, voice_id: str, system_text: str):
+    def __init__(self, region: str, model_id: str, voice_id: str, system_text: str, talk_first: bool = True):
         self._region = region
         self._model_id = model_id
         self._voice = voice_id
@@ -144,6 +170,7 @@ class VoiceAgent:
         self._bidi_stream = None
 
         self._prompt_key = "main"
+        self._inject_n = 0
         self._open_audio_content: Optional[str] = None
 
         self._out_audio_q: "asyncio.Queue[bytes | None]" = asyncio.Queue()
@@ -155,6 +182,9 @@ class VoiceAgent:
 
         # Public conversation context
         self.conversation_log: List[Dict[str, Any]] = []
+
+        self._talk_first = talk_first
+
 
     # ---- conversation bookkeeping ----
 
@@ -175,7 +205,62 @@ class VoiceAgent:
             except Exception:
                 pass
 
-        self.conversation_log.append({"role": role, "content": content})  
+        entry = {
+            "ts": time.time(),
+            "agent": AGENT_NAME,
+            "role": role,
+            "content": content,
+                    }
+        self.conversation_log.append(entry)
+        print(entry)
+                                            
+
+
+
+    async def inject_user_text(self, text: str):
+        """
+        Inject message as user role to NovaSonic. No audio, just text.  
+        Simulates user saying something without them actually saying something.
+
+        """
+        promptName = self._prompt_key
+        self._inject_n += 1
+        contentName = f"injection-{self._inject_n}"
+        await self._emit_event(
+            {
+                "event": {
+                    "contentStart": {
+                        "promptName": promptName,
+                        "contentName": contentName,
+                        "type": "TEXT",
+                        "interactive": True,
+                        "role": "USER",
+                        "textInputConfiguration": {"mediaType": "text/plain"}
+                    }
+                }
+            }
+        )
+        await self._emit_event(
+            {
+                "event": {
+                    "textInput": {
+                        "promptName": promptName,
+                        "contentName": contentName,
+                        "content": text
+                    }
+                }
+            }
+        )
+        await self._emit_event(
+            {
+                "event": {
+                    "contentEnd": {
+                        "promptName": promptName,
+                        "contentName": contentName
+                    }
+                }
+            }
+        )
 
 
     # ---- AWS auth wiring ----
@@ -262,56 +347,10 @@ class VoiceAgent:
 
         # background reader
         self._reader_task = asyncio.create_task(self._read_loop())
-    
-    #phase 2 initiate convo by sending text to nova (agents wont start talking until they hear something)
-    async def send_kickoff_text(self, text: str) -> None:
-        """
-        One-time USER text to trigger Nova to speak first.
-        After kickoff, the conversation is audio-driven via Twilio streams.
-        """
-        if not text or self._stop_flag.is_set():
-            return
 
-        content_name = "kickoff-1"
-        self._record("user", text)
-
-        await self._emit_event(
-            {
-                "event": {
-                    "contentStart": {
-                        "promptName": self._prompt_key,
-                        "contentName": content_name,
-                        "type": "TEXT",
-                        "interactive": True,
-                        "role": "USER",
-                        "textInputConfiguration": {"mediaType": "text/plain"},
-                    }
-                }
-            }
-        )
-
-        await self._emit_event(
-            {
-                "event": {
-                    "textInput": {
-                        "promptName": self._prompt_key,
-                        "contentName": content_name,
-                        "content": text,
-                    }
-                }
-            }
-        )
-
-        await self._emit_event(
-            {
-                "event": {
-                    "contentEnd": {
-                        "promptName": self._prompt_key,
-                        "contentName": content_name,
-                    }
-                }
-            }
-        )
+        # talk first
+        if self._talk_first:
+            await self.inject_user_text("hello")
 
 
     async def _emit_event(self, body: dict) -> None:
@@ -323,7 +362,6 @@ class VoiceAgent:
             value=BidirectionalInputPayloadPart(bytes_=raw)
         )
         await self._bidi_stream.input_stream.send(chunk)
-
 
     async def _send_system_block(self, text: str) -> None:
         if not text:
@@ -490,13 +528,8 @@ class VoiceAgent:
 
                         self._text_accumulator = ""
 
-        except (OSError, ValueError) as e:
-            # Normal when the stream is closing and the reader is mid-receive
-            if not self._stop_flag.is_set():
-                log.error(f"Error in Nova Sonic response processing: {e}", exc_info=True)
         except Exception as e:
             log.error(f"Error in Nova Sonic response processing: {e}", exc_info=True)
-
         finally:
             log.info(
                 "Nova Sonic stream closed. Events=%d, audio_chunks=%d, text_outputs=%d",
@@ -515,22 +548,43 @@ class VoiceAgent:
 
     async def shutdown(self) -> None:
         self._stop_flag.set()
-
-    # Close stream first to unblock receives
+        if self._reader_task:
+            self._reader_task.cancel()
         if self._bidi_stream:
             try:
                 await self._bidi_stream.close()
             except Exception:
                 pass
 
-    # Let reader exit naturally; only cancel if it hangs
-        if self._reader_task:
-            try:
-                await asyncio.wait_for(self._reader_task, timeout=2.0)
-            except asyncio.TimeoutError:
-                self._reader_task.cancel()
-            except Exception:
-                pass
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -546,8 +600,20 @@ api.add_middleware(
     allow_headers=["*"],
 )
 
+templates = Jinja2Templates(directory="templates")
+
 # streamSid -> agent
 active_calls: Dict[str, VoiceAgent] = {}
+
+
+
+@api.get("/", response_class=HTMLResponse)
+async def home(request: Request):
+    return templates.TemplateResponse("index.html", {
+        "request": request,
+        "example_number": "+155555555",
+    })
+
 
 
 @api.get("/context/{stream_sid}")
@@ -560,36 +626,21 @@ async def fetch_conversation(stream_sid: str):
         return {"stream_sid": stream_sid, "context_window": []}
     return {"stream_sid": stream_sid, "context_window": client.conversation_log}
 
+
 @api.post("/twilio_entrypoint")
 async def twilio_entrypoint(req: Request):
-    form = await req.form()
-    call_sid = form.get("CallSid", "")
-    log.info(f"[twilio webhook] CallSid={call_sid} From={form.get('From')} To={form.get('To')} Direction={form.get('Direction')}")
-
-    _log_parent_call_sid(call_sid)
-
-
+    """
+    Twilio Voice webhook: respond with TwiML that connects to agent WebSocket.
+    """
     ws_url = f"{PUBLIC_WSS_BASE}/voice_agent"
-
-    say = ""
-    if os.getenv("AUTO_START", "0") == "1":
-        # Twilio speaks into the call (no AWS Polly needed)
-        say = '<Say voice="Polly.Joanna">Hello. Please start with a short question.</Say>'
-
     twiml = f"""
 <Response>
-  {say}
   <Connect>
     <Stream url="{ws_url}" />
   </Connect>
 </Response>
 """.strip()
     return PlainTextResponse(content=twiml, media_type="text/xml")
-
-
-
-
-
 
 
 @api.websocket("/voice_agent")
@@ -600,21 +651,6 @@ async def voice_agent(ws: WebSocket):
     sid: Optional[str] = None
     bot: Optional[VoiceAgent] = None
     play_task: Optional[asyncio.Task] = None
-
-    last_media_ts = asyncio.get_event_loop().time()
-    keepalive_task: Optional[asyncio.Task] = None
-
-    async def _nova_keepalive():
-        # 20ms silence @ 16k PCM16 => 320 samples * 2 bytes = 640 bytes
-        silence_pcm16_16k = b"\x00" * 640
-        while True:
-            await asyncio.sleep(1.0)
-            if bot and not bot._stop_flag.is_set():
-                now = asyncio.get_event_loop().time()
-                # only push silence if nothing has arrived recently
-                if (now - last_media_ts) > 1.5:
-                    await bot.push_audio(silence_pcm16_16k)
-
 
     async def _playback_to_twilio(local_sid: str, client: VoiceAgent):
         """
@@ -664,23 +700,16 @@ async def voice_agent(ws: WebSocket):
                     model_id=MODEL_ARN_OR_ID,
                     voice_id=VOICE_NAME,
                     system_text=BASE_SYSTEM_INSTRUCTIONS,
+                    talk_first=False
                 )
                 active_calls[sid] = bot
 
                 await bot.begin()
                 await bot.ensure_audio_input_open()
 
-                ##phase 2 to initiate convo between two agents
-                if AGENT_ROLE == "A" and KICKOFF_TEXT:
-                    await bot.send_kickoff_text(KICKOFF_TEXT)
-
-                keepalive_task = asyncio.create_task(_nova_keepalive())
-
-
                 play_task = asyncio.create_task(_playback_to_twilio(sid, bot))
 
             elif evt_type == "media":
-                last_media_ts = asyncio.get_event_loop().time()
                 if not bot or not sid:
                     continue
 
@@ -700,18 +729,86 @@ async def voice_agent(ws: WebSocket):
     except Exception as e:
         log.error(f"Error in WebSocket handler: {e}", exc_info=True)
     finally:
-        if  keepalive_task:
-            keepalive_task.cancel()
-
-        if  play_task:
-            play_task.cancel()
-
         if bot:
             await bot.close_audio_input()
             await bot.shutdown()
+        if play_task:
+            play_task.cancel()
+        if sid and sid in active_calls:
+            del active_calls[sid]
+        await ws.close()
 
-        if sid:
-           active_calls.pop(sid, None)
+
+
+
+
+
+
+
+
+def trigger_outbound_call(to_number: str) -> str:
+    """
+    Triggers an outbound call via Twilio and points it at our TwiML webhook
+    (/twilio_entrypoint) so the callee gets connected to the same websocket agent.
+
+    Returns:
+        Twilio Call SID
+    """
+    if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_FROM_NUMBER):
+        raise RuntimeError("Missing TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / TWILIO_FROM_NUMBER env vars")
+
+    if not PUBLIC_BASE_URL:
+        raise RuntimeError("Missing PUBLIC_BASE_URL")
+
+    client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+    # Important: this must be a PUBLICLY reachable URL that returns TwiML
+    twiml_url = f"{PUBLIC_BASE_URL}/twilio_entrypoint"
+
+    call = client.calls.create(
+        to=to_number,
+        from_=TWILIO_FROM_NUMBER,
+        url=twiml_url,
+        method="POST",  # your endpoint supports POST
+    )
+
+    return call.sid
+
+
+
+
+@api.post("/start_outbound_call")
+async def start_outbound_call(payload: Dict[str, Any]):
+    """
+    Trigger an outbound call that connects to the existing voice agent pipeline.
+
+    Request JSON:
+      {"to": "+15551234567"}
+
+    Response:
+      {"call_sid": "..."}
+    """
+    to_number = (payload or {}).get("to")
+    if not to_number:
+        raise HTTPException(status_code=400, detail="Missing 'to' in JSON body")
+
+    try:
+        call_sid = trigger_outbound_call(to_number)
+        return {"ok": True, "to": to_number, "call_sid": call_sid}
+    except Exception as e:
+        log.error(f"Failed to start outbound call: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+
+
+
+
+
+
+
 
 
 

@@ -14,4 +14,5 @@ requests>=2.31.0
 numpy>=1.24.0
 scipy>=1.11.0
 g711>=1.0.0
-twilio>=9.0.0
+twilio>=8.12,<9.0
+jinja2

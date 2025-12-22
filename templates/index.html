@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Voice Agent - Outbound Call</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 32px; }
+    .card { max-width: 680px; padding: 20px; border: 1px solid #ddd; border-radius: 12px; }
+    label { display:block; font-weight:600; margin-bottom:8px; }
+    input[type="text"] { width: 100%; padding: 10px 12px; font-size: 16px; border: 1px solid #ccc; border-radius: 10px; }
+    button { margin-top: 12px; padding: 10px 14px; font-size: 16px; border-radius: 10px; border: 0; cursor: pointer; }
+    .row { margin-top: 12px; }
+    .hint { color: #555; font-size: 14px; }
+    .ok { color: #0a7; font-weight: 600; }
+    .err { color: #b00; font-weight: 600; }
+    code { background: #f4f4f4; padding: 2px 6px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Trigger Outbound Call</h2>
+    <p class="hint">
+      Enter a phone number in <b>E.164</b> format:
+      <code>{{ example_number }}</code>. No spaces or dashes.
+    </p>
+
+    <label for="to">Phone number</label>
+    <input id="to" type="text" placeholder="{{ example_number }}" inputmode="tel" autocomplete="tel" />
+
+    <div class="row">
+      <button id="callBtn">Start Call</button>
+    </div>
+
+    <div class="row hint">
+      Basic checks:
+      <ul>
+        <li>Must start with <code>+</code></li>
+        <li>Must contain 8–15 digits after <code>+</code></li>
+        <li>Digits only (no spaces, dashes, parentheses)</li>
+      </ul>
+    </div>
+
+    <div id="status" class="row"></div>
+    <div id="result" class="row hint"></div>
+  </div>
+
+<script>
+(function () {
+  const toInput = document.getElementById("to");
+  const callBtn = document.getElementById("callBtn");
+  const statusEl = document.getElementById("status");
+  const resultEl = document.getElementById("result");
+
+  function isE164(s) {
+    return /^\+[1-9]\d{7,14}$/.test(s);
+  }
+
+  function setStatus(msg, ok) {
+    statusEl.textContent = msg;
+    statusEl.className = ok ? "row ok" : "row err";
+  }
+
+  async function startCall() {
+    const raw = (toInput.value || "").trim();
+    const cleaned = raw.replace(/[\s\-().]/g, "");
+    if (raw !== cleaned) toInput.value = cleaned;
+
+    if (!cleaned) {
+      setStatus("Please enter a phone number.", false);
+      return;
+    }
+    if (!isE164(cleaned)) {
+      setStatus("Invalid format. Use E.164 like {{ example_number }} (no spaces/dashes).", false);
+      return;
+    }
+
+    setStatus("Starting call…", true);
+    resultEl.textContent = "";
+
+    try {
+      const resp = await fetch("/start_outbound_call", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ to: cleaned }),
+      });
+
+      const data = await resp.json().catch(() => ({}));
+
+      if (!resp.ok) {
+        const detail = data.detail ? String(data.detail) : "Unknown error";
+        setStatus("Failed to start call.", false);
+        resultEl.textContent = detail;
+        return;
+      }
+
+      setStatus("Call started!", true);
+      resultEl.textContent = "Call SID: " + (data.call_sid || "(unknown)");
+    } catch (e) {
+      setStatus("Request error.", false);
+      resultEl.textContent = String(e);
+    }
+  }
+
+  callBtn.addEventListener("click", startCall);
+  toInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") startCall();
+  });
+})();
+</script>
+</body>
+</html>
