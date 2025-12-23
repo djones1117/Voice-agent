@@ -57,7 +57,7 @@ MODEL_ARN_OR_ID = os.getenv("BEDROCK_MODEL_ID", "amazon.nova-2-sonic-v1:0")
 VOICE_NAME = os.getenv("AGENT_VOICE", "tiffany")
 BASE_SYSTEM_INSTRUCTIONS = os.getenv(
     "AGENT_SYSTEM_PROMPT",
-    "You are a helpful, friendly voice assistant named Sally. " 
+    "You are a helpful, friendly voice assistant named Sally." 
     "You like Lord of the rings. Respond to matthew's responses that are about Lord of the rings."
     "Speak clearly, keep responses brief, and be polite.",
 )
