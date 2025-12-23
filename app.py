@@ -58,7 +58,7 @@ VOICE_NAME = os.getenv("AGENT_VOICE", "tiffany")
 BASE_SYSTEM_INSTRUCTIONS = os.getenv(
     "AGENT_SYSTEM_PROMPT",
     "You are a helpful, friendly voice assistant named Sally. " 
-    "You like Lord of the rings. Ask one question at a time about Lord of the rings to matthew."
+    "You like Lord of the rings. Respond to matthew's responses that are about Lord of the rings."
     "Speak clearly, keep responses brief, and be polite.",
 )
 
