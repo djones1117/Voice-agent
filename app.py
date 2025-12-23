@@ -10,15 +10,16 @@ import pathlib
 import uuid
 import db_utils as db
 from contextlib import asynccontextmanager
+from audio_helpers import _twilio_b64_ulaw_to_pcm16_16k, _pcm16_24k_to_twilio_b64_ulaw
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.responses import PlainTextResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.templating import Jinja2Templates
 
-import numpy as np
-from scipy.signal import resample_poly
-import g711
+# import numpy as np
+# from scipy.signal import resample_poly
+# import g711
 
 from aws_sdk_bedrock_runtime.client import (
     BedrockRuntimeClient,
@@ -40,13 +41,8 @@ from smithy_aws_core.credentials_resolvers.environment import (
 from twilio.rest import Client as TwilioClient
 
 
-
-
-
-
-# -----------------------------------------------------------------------------
 # Logging + environment configuration
-# -----------------------------------------------------------------------------
+
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("novasonic-app")
@@ -84,82 +80,7 @@ SCHEMA_SQL = (pathlib.Path(__file__).resolve().parent / "schema.sql").read_text(
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# -----------------------------------------------------------------------------
-# Audio conversion: Twilio μ-law 8kHz <-> Nova Sonic PCM16 (16k in, 24k out)
-# -----------------------------------------------------------------------------
-
-def _twilio_b64_ulaw_to_pcm16_16k(b64_payload: str) -> bytes:
-    """
-    Twilio media.payload (base64 μ-law / 8k) -> PCM16 mono @ 16 kHz.
-
-    Pipeline:
-        base64 μ-law 8kHz -> float32 [-1,1] 8kHz -> resample -> float32 16kHz -> PCM16 LE
-    """
-    ulaw = base64.b64decode(b64_payload)
-    audio_8k = g711.decode_ulaw(ulaw).astype(np.float32)
-
-    audio_16k = resample_poly(audio_8k, up=2, down=1).astype(np.float32)
-    audio_16k = np.clip(audio_16k, -1.0, 1.0)
-
-    pcm_i16 = (audio_16k * 32767.0).astype("<i2")
-    return pcm_i16.tobytes()
-
-
-def _pcm16_24k_to_twilio_b64_ulaw(pcm24k: bytes) -> str:
-    """
-    PCM16 mono 24k bytes (from Nova Sonic 'pcm16' output) -> Twilio media.payload.
-
-    Pipeline:
-        PCM16 LE 24kHz -> float32 [-1,1] 24kHz -> resample -> float32 8kHz -> μ-law -> base64
-    """
-    audio_24k = np.frombuffer(pcm24k, dtype="<i2").astype(np.float32) / 32768.0
-    audio_8k = resample_poly(audio_24k, up=1, down=3).astype(np.float32)
-    audio_8k = np.clip(audio_8k, -1.0, 1.0)
-
-    ulaw = g711.encode_ulaw(audio_8k)
-    return base64.b64encode(ulaw).decode("ascii")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# -----------------------------------------------------------------------------
-# Minimal Nova Sonic bidirectional client with context capture
-# -----------------------------------------------------------------------------
-
+#wrapper class for the novasonic streaming api that manages context windows - convo log
 class VoiceAgent:
     """
     Minimal Nova Sonic bidirectional client.
@@ -196,7 +117,7 @@ class VoiceAgent:
         self._talk_first = talk_first
 
 
-    # ---- conversation bookkeeping ----
+    # handles real time turns of the ongoing transcript,inserting role,content,etc to db
 
     def _record(self, role: str, content: str) -> None:
         if self.conversation_log:
@@ -254,6 +175,7 @@ class VoiceAgent:
         promptName = self._prompt_key
         self._inject_n += 1
         contentName = f"injection-{self._inject_n}"
+        #transmits -> novasonic
         await self._emit_event(
             {
                 "event": {
@@ -291,7 +213,7 @@ class VoiceAgent:
         )
 
 
-    # ---- AWS auth wiring ----
+    ##not being used currently - would be used if deployed to aws 
 
     def _mirror_boto3_creds_to_env(self) -> None:
         """
@@ -308,8 +230,8 @@ class VoiceAgent:
         if frozen.token:
             os.environ["AWS_SESSION_TOKEN"] = frozen.token
 
-    # ---- session lifecycle ----
-
+    #starts connection to novasonic api
+    #referenced from the novasonic doc + llm
     async def begin(self) -> None:
         """
         Open the bidirectional stream, configure prompt/audio output, send system prompt,
@@ -376,11 +298,11 @@ class VoiceAgent:
         # background reader
         self._reader_task = asyncio.create_task(self._read_loop())
 
-        # talk first
+        # make agent talk first
         if self._talk_first:
             await self.inject_user_text("hello")
 
-
+    #formatting events that we send to novasonic
     async def _emit_event(self, body: dict) -> None:
         if not self._bidi_stream:
             return
@@ -390,7 +312,7 @@ class VoiceAgent:
             value=BidirectionalInputPayloadPart(bytes_=raw)
         )
         await self._bidi_stream.input_stream.send(chunk)
-
+    #system prompting for the agent
     async def _send_system_block(self, text: str) -> None:
         if not text:
             return
@@ -429,7 +351,7 @@ class VoiceAgent:
             {"event": {"contentEnd": {"promptName": self._prompt_key, "contentName": content_name}}}
         )
 
-    # ---- audio input / output ----
+    # audio input and output based off novasonic github sample
 
     async def ensure_audio_input_open(self) -> None:
         if self._open_audio_content:
@@ -458,6 +380,7 @@ class VoiceAgent:
                 }
             }
         )
+    # referenced from novasonic docs to ensure audio output is formatted correctly   
 
     async def push_audio(self, pcm16_16k: bytes) -> None:
         if not self._open_audio_content or self._stop_flag.is_set():
@@ -491,6 +414,8 @@ class VoiceAgent:
             }
         )
         self._open_audio_content = None
+
+    #manages the literal audio stream    
 
     async def _read_loop(self) -> None:
         """
@@ -625,10 +550,7 @@ async def lifespan(app: FastAPI):
 
 
 
-
-# -----------------------------------------------------------------------------
-# FastAPI app + routes
-# -----------------------------------------------------------------------------
+####routes
 
 api = FastAPI(lifespan=lifespan)
 api.add_middleware(
@@ -754,7 +676,7 @@ async def voice_agent(ws: WebSocket):
                 call_sid = start.get("callSid")  
                 base_session = call_sid or str(uuid.uuid4())
                 session_id = f"{RUN_ID}:{base_session}" if RUN_ID else base_session
-
+                #instantiate the voice agent and pass in params
                 bot = VoiceAgent(
                     region=REGION_NAME,
                     model_id=MODEL_ARN_OR_ID,
@@ -809,7 +731,7 @@ async def voice_agent(ws: WebSocket):
 
 
 
-
+##purely twilio api - referenced from the twilio docs
 def trigger_outbound_call(to_number: str) -> str:
     """
     Triggers an outbound call via Twilio and points it at our TwiML webhook
@@ -840,7 +762,7 @@ def trigger_outbound_call(to_number: str) -> str:
 
 
 
-
+##mechanism to trigger the func through index.html
 @api.post("/start_outbound_call")
 async def start_outbound_call(payload: Dict[str, Any]):
     """
