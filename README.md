@@ -353,12 +353,12 @@ docker exec -it local-postgres psql -U voice_app -d voice_agent_app -c \
  FROM transcript_messages
  ORDER BY ts_epoch DESC
  LIMIT 25;"
-
+```
 ### 2 Inside psql — session rollup (reporting + retrieval)
 
 Shows: per-session summary (start time, last activity time, message count). This makes it easy to find the most recent session to inspect.
 
-
+```bash
 SELECT
   session_id,
   MIN(to_timestamp(ts_epoch)) AS started_at,
@@ -368,13 +368,13 @@ FROM transcript_messages
 GROUP BY session_id
 ORDER BY last_at DESC
 LIMIT 20;
-
+```
 
 ### Inside psql — latest transcript messages (timestamp + role + content)
 
 Shows: most recent messages across all sessions (easy “did logging work?” sanity check).
 
-
+```bash
 SELECT
   to_char(to_timestamp(ts_epoch), 'YYYY-MM-DD HH24:MI:SS') AS ts,
   session_id,
@@ -383,22 +383,22 @@ SELECT
 FROM transcript_messages
 ORDER BY ts_epoch DESC
 LIMIT 50;
-
+```
 ---
 
 # Local “health checks” (sanity)
 
 Home page:
 
-~~~text
+```bash
 GET http://localhost:<PORT>/
-~~~
+
 
 List sessions:
 
-~~~text
+
 GET http://localhost:<PORT>/sessions
-~~~
+
 
 Fetch a session:
 
