@@ -222,7 +222,7 @@ export AGENT_SYSTEM_PROMPT='You are Matthew. Your favorite lord of the rings cha
 ### 3 Start both apps + both ngroks
 
 
-### 3 Start both apps + both ngroks
+
 
 ### Agent A
 
