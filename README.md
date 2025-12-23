@@ -1,7 +1,7 @@
 # Novasonic (AWS Bedrock) Bidirectional Streaming Voice Agent — FastAPI + Twilio
 
 Real-time speech-to-speech voice agent using **Amazon Nova Sonic (Bedrock Runtime bidirectional streaming)** + **Twilio Voice Media Streams**, with **Postgres** transcript logging and **configurable system prompts**.  
-Designed to run as **two independently hosted app instances** (Agent A / Agent B) by cloning the same codebase and changing env values. (Change prompts, set one agents talk_first to false and the other to true. Change the VOICE_NAME if you want a different voice - matthew works. Tiffany is default)
+Designed to run as **two independently hosted app instances** (Agent A / Agent B) by running an instance of the source code and exporting env values. (Change prompts, voices, etc. Change the VOICE_NAME if you want a different voice - matthew works. Tiffany is default)
 
 ---
 
@@ -19,12 +19,12 @@ Designed to run as **two independently hosted app instances** (Agent A / Agent B
 
 ## Repo layout (expected)
 
-- `app.py` — FastAPI app, Twilio webhook + Media Streams WS, Nova Sonic client, transcript writes
+- `app.py` — FastAPI app, Twilio webhook + Media Streams WS, Nova Sonic client, transcript logging
 - `db_utils.py` — asyncpg pool + queries
 - `schema.sql` — `transcript_messages` table
 - `env.sh` — local environment exports (you maintain per instance)
 - `requirements.txt`
-- `templates/index.html` — optional landing page
+- `templates/index.html` — optional test page
 
 ---
 
@@ -76,7 +76,7 @@ The app loads `schema.sql` on startup (lifespan) and will create the table if mi
 
 ## Environment variables (per app instance)
 
-Create and configure `env.sh` in each instance folder (`A` and `B`) and `source` it before running.
+Create and configure `env.sh` in each the folder and `source` it before running.
 
 ### Core
 
@@ -86,12 +86,13 @@ export AWS_ACCESS_KEY_ID=
 export AWS_SECRET_ACCESS_KEY
 
 export DATABASE_URL="postgresql://voice_app:voice_pass@localhost:5432/voice_agent_app"
-# Stored in DB as app_instance ("A" for Agent A, "B" for Agent B)
+
+
 export AGENT_NAME="A"
 
 ### Twilio
 
-~~~bash
+
 export TWILIO_ACCOUNT_SID="ACxxxxxxxx"
 export TWILIO_AUTH_TOKEN="xxxxxxxx"
 export TWILIO_FROM_NUMBER="+1xxxxxxxxxx"
@@ -151,9 +152,9 @@ export WSS_VOICE_URL="wss://…"  # same domain, just wss://
 If you change env.sh then -
 Restart uvicorn after updating env:
 
-~~~bash
+
 # Ctrl+C to stop then re-run app.py after sourcing your updated env
-~~~
+
 
 ---
 
@@ -182,29 +183,43 @@ Call the Twilio number. Twilio will:
 
 # Running TWO independent agents locally (Phase 2)
 
-You run two copies of the app on different ports and different ngrok tunnels.
+Phase 2 runs two independent instances (A and B) from the same codebase by starting the service twice on different ports and exporting different env values per terminal
 
-## 1 Duplicate the app folder
 
-~~~bash
-cp -R voice_agent_app voice_agent_app_b
-~~~
 
 ## 2 Change ONLY the per-instance env values in the second instance
 
 ### Agent B (instance B)
 
+> Do **not** reuse Agent A’s `PORT`, `PUBLIC_BASE_URL`, `WSS_VOICE_URL`, or `TWILIO_FROM_NUMBER`.
+> Agent B must have its **own** port + ngrok tunnel + Twilio number.
+
+#do this first
+```
+source env.sh
+```
 ~~~bash
+# Required per-instance values
 export PORT="8081"
 export AGENT_NAME="B"
 
-export TWILIO_FROM_NUMBER="<Twilio Number B>"
+# Twilio number used by *this* instance when making outbound calls. must be different from a
+export TWILIO_FROM_NUMBER="+1XXXXXXXXXX"   # <-- Twilio Number B
 
-export PUBLIC_BASE_URL="https://<ngrok-B>"
-export WSS_VOICE_URL="wss://<ngrok-B>"
+# Public URLs for *this* instance (ngrok-B domain). MUST be different than Agent A or app will not work. 
+export PUBLIC_BASE_URL="https://<ngrok-b-domain>.ngrok-free.dev"
+export WSS_VOICE_URL="wss://<ngrok-b-domain>.ngrok-free.dev"
+
+# Optional scenario prompt + voice overrides (override defaults in app.py via os.getenv) important if you want them to have diff voices/personalities/scenarios
+export AGENT_VOICE="matthew"
+export AGENT_SYSTEM_PROMPT='You are Matthew. Your favorite lord of the rings character is Gandalf. You are answering questions about lord of the rings'
 ~~~
+
 # Optional scenario prompt:
-# export AGENT_SYSTEM_PROMPT="..." enter whatever you would like - just make sure it makes sense or the agents convo might be chaotic. 
+# export AGENT_SYSTEM_PROMPT="..." enter whatever you would like - just make sure it makes sense or the agents convo might be chaotic.
+
+
+### 3 Start both apps + both ngroks
 
 
 ### 3 Start both apps + both ngroks
@@ -212,10 +227,10 @@ export WSS_VOICE_URL="wss://<ngrok-B>"
 ### Agent A
 
 ~~~bash
-cd voice_agent_app
+
 source env/bin/activate
 source env.sh
-uvicorn app:api --host 0.0.0.0 --port 8080
+uvicorn app:api --host 0.0.0.0 --port 8080 # or python3 app.py
 ~~~
 
 ~~~bash
@@ -224,15 +239,20 @@ ngrok http 8080
 
 ### Agent B
 
-~~~bash
-cd ../voice_agent_app_b
-source env/bin/activate
-source env.sh
-uvicorn app:api --host 0.0.0.0 --port 8081
+~~~bash 
+source env/bin/activate #if not activated - we dont source the env since we already did it before exporting new values
+uvicorn app:api --host 0.0.0.0 --port 8081 # or python3 app.py
 ~~~
 
 ~~~bash
 ngrok http 8081
+~~~
+~~~bash
+# Make sure your env vars are actually set for this instance: or it will not work
+env | egrep '^(PORT|AGENT_VOICE|AGENT_SYSTEM_PROMPT|TWILIO_FROM_NUMBER|PUBLIC_BASE_URL|WSS_VOICE_URL)='
+
+# If you have a reserved ngrok domain and want to force it:
+ngrok http 8081 --url=https://<ngrok-b-domain>.ngrok-free.dev
 ~~~
 
 ---
@@ -244,7 +264,7 @@ ngrok http 8081
 
 ---
 
-## 5 Kicking off calls (outbound) - optional go to the forward address in your ngrok tunnel and you can test calls from there - you can get the agent to call you or you can call the agent. The agents can also call each other. 
+## 5 Kicking off calls (outbound) - optional go to the forward address in your ngrok tunnel and you can test calls from there - you can get the agent to call you or you can call the agent. The agents can also call each other. copy and paste your ngrok url in a browser for easy testing
 
 Your app exposes:
 
@@ -312,24 +332,57 @@ Notes:
 - `user`
 - `agent` 
 
-## Quick query (run from your normal shell, NOT inside psql)
+## Transcript queries (Postgres)
 
-~~~bash
+These queries help you verify that transcripts are being stored correctly and support **reporting + retrieval** (timestamps, session identifiers, speaker/role labels, and message content).
+
+### 1 Quick query (run from your normal shell, NOT inside psql)
+
+Shows: latest transcript rows across all sessions (useful for fast sanity checks).
+
+```bash
 docker exec -it local-postgres psql -U voice_app -d voice_agent_app -c \
-"SELECT to_timestamp(ts_epoch) AS ts, app_instance, role, LEFT(content, 80) AS content
+"SELECT
+   id,
+   to_char(to_timestamp(ts_epoch), 'YYYY-MM-DD HH24:MI:SS') AS ts,
+   session_id,
+   role,
+   call_sid,
+   stream_sid,
+   left(content, 80) AS content
  FROM transcript_messages
  ORDER BY ts_epoch DESC
- LIMIT 20;"
-~~~
+ LIMIT 25;"
 
-## If you are already inside psql
+### 2 Inside psql — session rollup (reporting + retrieval)
 
-~~~sql
-SELECT to_timestamp(ts_epoch) AS ts, app_instance, role, LEFT(content, 80) AS content
+Shows: per-session summary (start time, last activity time, message count). This makes it easy to find the most recent session to inspect.
+
+
+SELECT
+  session_id,
+  MIN(to_timestamp(ts_epoch)) AS started_at,
+  MAX(to_timestamp(ts_epoch)) AS last_at,
+  COUNT(*)                    AS message_count
+FROM transcript_messages
+GROUP BY session_id
+ORDER BY last_at DESC
+LIMIT 20;
+
+
+### Inside psql — latest transcript messages (timestamp + role + content)
+
+Shows: most recent messages across all sessions (easy “did logging work?” sanity check).
+
+
+SELECT
+  to_char(to_timestamp(ts_epoch), 'YYYY-MM-DD HH24:MI:SS') AS ts,
+  session_id,
+  role,
+  left(content, 200) AS content
 FROM transcript_messages
 ORDER BY ts_epoch DESC
-LIMIT 20;
-~~~
+LIMIT 50;
 
 ---
 
@@ -349,10 +402,9 @@ GET http://localhost:<PORT>/sessions
 
 Fetch a session:
 
-~~~text
-GET http://localhost:<PORT>/sessions/<session_id>
-~~~
 
+GET http://localhost:<PORT>/sessions/<session_id>
+```
 ---
 
 ## AWS CDK deployment (planned implementation)
