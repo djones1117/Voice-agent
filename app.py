@@ -120,21 +120,21 @@ class VoiceAgent:
     # handles real time turns of the ongoing transcript,inserting role,content,etc to db
 
     def _record(self, role: str, content: str) -> None:
-        if self.conversation_log:
-            try:
-                last = self.conversation_log[-1]
-                if last.get("role") == role and last.get("content") == content:
-                    log.debug("Skipping duplicate conversation entry")
-                    return
-            except Exception:
-                pass
-            try:
-                prev = self.conversation_log[-2]
-                if prev.get("role") == role and prev.get("content") == content:
-                    log.debug("Skipping duplicate conversation entry (prev)")
-                    return
-            except Exception:
-                pass
+        
+        try:
+            last = self.conversation_log[-1]
+            if last.get("role") == role and last.get("content") == content:
+                log.debug("Skipping duplicate conversation entry")
+                return
+        except Exception:
+            pass
+        try:
+            prev = self.conversation_log[-2]
+            if prev.get("role") == role and prev.get("content") == content:
+                log.debug("Skipping duplicate conversation entry (prev)")
+                return
+        except Exception:
+            pass
 
 
         entry = {

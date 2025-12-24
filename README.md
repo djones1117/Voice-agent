@@ -76,14 +76,15 @@ The app loads `schema.sql` on startup (lifespan) and will create the table if mi
 
 ## Environment variables (per app instance)
 
-Create and configure `env.sh` in each the folder and `source` it before running.
+Create and configure `env.sh` in each directory and `source` it before running.
 
 ### Core
 
 ~~~bash
 export AWS_REGION="us-east-1"
-export AWS_ACCESS_KEY_ID=
-export AWS_SECRET_ACCESS_KEY
+# Use an IAM user's access keys (or better: a short-lived role via aws sso)
+export AWS_ACCESS_KEY_ID="AKIAxxxxxxxxxxxxxxxx"
+export AWS_SECRET_ACCESS_KEY="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
 export DATABASE_URL="postgresql://voice_app:voice_pass@localhost:5432/voice_agent_app"
 
@@ -141,7 +142,7 @@ python3 app.py - should initally be on port 8080
 ngrok http $PORT - you can set it to 8080 or 8081 or whatever port app.py is running on
 ~~~
 
-Copy the ngrok **HTTPS** forwarding URL to use a simple UI test:
+Copy and paste **HTTPS** forwarding URL into the browser to render the templates/index.html page which provides a UI for testing outbound calls
 
 ~~~bash
 export PUBLIC_BASE_URL="https://…"
@@ -158,7 +159,7 @@ Restart uvicorn after updating env:
 
 ---
 
-## Configure Twilio webhook for inbound calls
+## Configure Twilio webhook for inbound and outbound calls
 
 In **Twilio Console → Phone Number → Voice**:
 
@@ -264,7 +265,7 @@ ngrok http 8081 --url=https://<ngrok-b-domain>.ngrok-free.dev
 
 ---
 
-## 5 Kicking off calls (outbound) - optional go to the forward address in your ngrok tunnel and you can test calls from there - you can get the agent to call you or you can call the agent. The agents can also call each other. copy and paste your ngrok url in a browser for easy testing
+## 5 Kicking off calls (outbound) - optional go to the forward address in your ngrok tunnel and paste the address into your browser and you can test calls from the index.html page - you can get the agent to call you or you can call the agent. The agents can also call each other. copy and paste your ngrok url in a browser for easy testing
 
 Your app exposes:
 
@@ -393,19 +394,23 @@ LIMIT 50;
 Home page:
 
 ```bash
-GET http://localhost:<PORT>/
+GET http://<yourngrokurl>:<PORT>/
 
 
 List sessions:
 
 
-GET http://localhost:<PORT>/sessions
+GET http://<yourngrokurl>:<PORT>/sessions
 
 
 Fetch a session:
 
 
-GET http://localhost:<PORT>/sessions/<session_id>
+GET http://<yourngrokurl>:<PORT>/sessions/<session_id>
+
+
+
+GET "http://<your-ngrok-url>:<PORT>/context/<stream_sid>"
 ```
 ---
 
@@ -505,6 +510,7 @@ In the FastAPI app, I would support a configurable `BASE_PATH` (or mount routers
 - `DatabaseInstance` (Postgres) in private subnets
 - DB credentials generated/stored in Secrets Manager
 - ECS services granted permission to read DB secret
+- Would refactor postgres python wrapper class to connect to postgres using data api rather than a direct connection 
 
 **5 IAM**
 - Task role with Bedrock invoke permissions + Secrets Manager read
